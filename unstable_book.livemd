@@ -16,7 +16,7 @@ EXLA.set_as_nx_default([:tpu, :cuda, :rocm, :host])
 
 An attempt to write a working implementation of Stable Diffusion inference in Elixir with Axon
 
-<!-- livebook:{"break_markdown":true} -->
+## Prompt Tokenizer
 
 SimpleTokenizer code copied from the [Keras implementation](https://github.com/keras-team/keras-cv/blob/036eda9d039226101a7170db81a0bc3dbbff8d85/keras_cv/models/generative/stable_diffusion/clip_tokenizer.py#L153)
 
@@ -67,9 +67,22 @@ defmodule SimpleTokenizer do
     {:reply, vocab, vocab}
   end
 
-  def _encode(text, _vocab) do
+  def _encode(text, vocab) do
     Regex.scan(@pat, clean(text))
     |> List.flatten()
+    |> Enum.map(fn token ->
+      token
+      |> :binary.bin_to_list()
+      |> Enum.map(&Map.get(vocab[:byte_encoder], &1))
+      |> Enum.join()
+    end)
+    |> Enum.map(&bpe(&1, vocab))
+    |> List.flatten()
+    |> then(fn words ->
+      [Map.get(vocab[:encoder], "<|startoftext|>")] ++
+        Enum.map(words, &Map.get(vocab[:encoder], &1)) ++
+        [Map.get(vocab[:encoder], "<|endoftext|>")]
+    end)
   end
 
   def _decode(encoding, vocab) do
@@ -77,24 +90,20 @@ defmodule SimpleTokenizer do
   end
 
   def clean(text) do
-    text |> basic_clean() |> whitespace_clean() |> String.downcase()
-  end
-
-  defp basic_clean(text) do
-    text |> HtmlEntities.decode() |> HtmlEntities.decode()
-  end
-
-  defp whitespace_clean(text) do
-    String.replace(text, ~r/\s+/, " ")
+    text
+    |> HtmlEntities.decode()
+    |> HtmlEntities.decode()
+    |> String.replace(~r/\s+/, " ")
+    |> String.downcase()
   end
 
   def bytes_to_unicode() do
     codepoints =
-      [?!..(?~ + 1), ?¡..(?¬ + 1), ?®..(?ÿ + 1)]
+      [?!..?~, ?¡..?¬, ?®..?ÿ]
       |> Enum.map(&Enum.to_list/1)
       |> Enum.concat()
 
-    extras = for c <- 0..256, !Enum.member?(codepoints, c), do: c
+    extras = for c <- 0..255, !Enum.member?(codepoints, c), do: c
 
     Map.new(
       Enum.zip(
@@ -115,7 +124,7 @@ defmodule SimpleTokenizer do
     body
     |> :zlib.gunzip()
     |> String.split("\n")
-    |> Enum.slice(1, 49152 - 256 - 2 + 1)
+    |> Enum.slice(1, 49152 - 256 - 2)
     |> Enum.map(&String.split(&1))
     |> Enum.map(&List.to_tuple/1)
   end
@@ -135,6 +144,7 @@ defmodule SimpleTokenizer do
     encoder = Map.new(Enum.zip(vocab, 0..length(vocab)))
 
     %{
+      byte_encoder: byte_encoder,
       encoder: encoder,
       decoder: Map.new(encoder, fn {key, val} -> {val, key} end),
       bpe_ranks: Map.new(Enum.zip(bpe_vocab_subset, 0..length(bpe_vocab_subset)))
@@ -158,53 +168,47 @@ defmodule SimpleTokenizer do
 
   def pairs_set(word), do: MapSet.new(get_pairs(word))
 
+  def merge_word(selected, [a | [b | rest]], acc) when {a, b} == selected do
+    merge_word(selected, rest, [a <> b | acc])
+  end
+
+  def merge_word(selected, [a | [b | rest]], acc) do
+    merge_word(selected, [b | rest], [a | acc])
+  end
+
+  def merge_word(selected, [a | []], acc) do
+    merge_word(selected, [], [a | acc])
+  end
+
+  def merge_word(_selected, [], acc), do: Enum.reverse(acc)
+
+  def flatten_words(word, _, _) when length(word) == 1, do: word
+
+  def flatten_words(word, max_rank, vocab) do
+    set = pairs_set(word)
+    best_ranked = Enum.min_by(set, fn pair -> Map.get(vocab[:bpe_ranks], pair, max_rank) end)
+    rank = Map.get(vocab[:bpe_ranks], best_ranked, max_rank)
+
+    cond do
+      rank == max_rank -> word
+      true -> flatten_words(merge_word(best_ranked, word, []), max_rank, vocab)
+    end
+  end
+
   def bpe(token, vocab) do
+    word = get_word(token)
+    max_rank = Enum.count(vocab[:bpe_ranks])
+    flatten_words(word, max_rank, vocab)
   end
 end
 ```
 
 ```elixir
-vocab = SimpleTokenizer.vocab()
+vocab = SimpleTokenizer.build_vocab_list()
+Enum.count(Map.get(vocab, :byte_encoder))
 ```
 
 ```elixir
-SimpleTokenizer._encode("hełło there how are you", vocab)
-```
-
-```elixir
-bpe = fn token, vocab ->
-  word = SimpleTokenizer.get_word(token)
-  max_rank = Enum.count(vocab[:bpe_ranks])
-
-  reduce_pairs = fn word ->
-    pset = SimpleTokenizer.pairs_set(word)
-    min = Enum.min_by(pset, fn pair -> Map.get(vocab[:bpe_ranks], pair, max_rank) end)
-    IO.inspect(min)
-
-    word
-    |> SimpleTokenizer.get_pairs()
-    |> Enum.map(fn
-      {a, b} = chunk when chunk == min -> {a <> b}
-      chunk -> chunk
-    end)
-    |> tap(&IO.inspect/1)
-    |> Enum.reverse()
-    |> then(fn [last | rest] ->
-      Enum.reverse(Tuple.to_list(last)) ++ Enum.map(rest, &elem(&1, 0))
-    end)
-    |> Enum.reverse()
-  end
-
-  word
-  |> reduce_pairs.()
-  |> tap(&IO.inspect/1)
-  |> reduce_pairs.()
-  |> tap(&IO.inspect/1)
-  |> reduce_pairs.()
-  |> tap(&IO.inspect/1)
-  |> reduce_pairs.()
-  |> tap(&IO.inspect/1)
-end
-
-bpe.("hello", vocab)
+{:ok, _} = SimpleTokenizer.start_link([])
+SimpleTokenizer.encode("an astonaut riding a horse on the moon")
 ```
