@@ -1,0 +1,210 @@
+# Unstable Book
+
+```elixir
+Mix.install([
+  {:axon, github: "elixir-nx/axon"},
+  {:exla, "~> 0.2.2"},
+  {:nx, "~> 0.3.0", github: "elixir-nx/nx", sparse: "nx", branch: "main", override: true},
+  {:req, "~> 0.3.0"},
+  {:html_entities, "~> 0.5"}
+])
+
+EXLA.set_as_nx_default([:tpu, :cuda, :rocm, :host])
+```
+
+## Intro
+
+An attempt to write a working implementation of Stable Diffusion inference in Elixir with Axon
+
+<!-- livebook:{"break_markdown":true} -->
+
+SimpleTokenizer code copied from the [Keras implementation](https://github.com/keras-team/keras-cv/blob/036eda9d039226101a7170db81a0bc3dbbff8d85/keras_cv/models/generative/stable_diffusion/clip_tokenizer.py#L153)
+
+```elixir
+defmodule SimpleTokenizer do
+  use GenServer
+
+  @pat ~r/<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+/iu
+
+  @bpe_vocab_list "https://github.com/openai/CLIP/blob/main/clip/bpe_simple_vocab_16e6.txt.gz?raw=true"
+
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  end
+
+  def vocab() do
+    GenServer.call(__MODULE__, {:vocab})
+  end
+
+  def encode(text) do
+    GenServer.call(__MODULE__, {:encode, text})
+  end
+
+  def decode(encoding) do
+    GenServer.call(__MODULE__, {:decode, encoding})
+  end
+
+  @impl true
+  def init(_) do
+    vocab = build_vocab_list()
+    {:ok, vocab}
+  end
+
+  @impl true
+  def handle_call({:encode, text}, _from, vocab) do
+    encoding = _encode(text, vocab)
+    {:reply, encoding, vocab}
+  end
+
+  @impl true
+  def handle_call({:decode, encoding}, _from, vocab) do
+    reversed = _decode(encoding, vocab)
+    {:reply, reversed, vocab}
+  end
+
+  @impl true
+  def handle_call({:vocab}, _from, vocab) do
+    {:reply, vocab, vocab}
+  end
+
+  def _encode(text, _vocab) do
+    Regex.scan(@pat, clean(text))
+    |> List.flatten()
+  end
+
+  def _decode(encoding, vocab) do
+    {encoding, vocab}
+  end
+
+  def clean(text) do
+    text |> basic_clean() |> whitespace_clean() |> String.downcase()
+  end
+
+  defp basic_clean(text) do
+    text |> HtmlEntities.decode() |> HtmlEntities.decode()
+  end
+
+  defp whitespace_clean(text) do
+    String.replace(text, ~r/\s+/, " ")
+  end
+
+  def bytes_to_unicode() do
+    codepoints =
+      [?!..(?~ + 1), ?¡..(?¬ + 1), ?®..(?ÿ + 1)]
+      |> Enum.map(&Enum.to_list/1)
+      |> Enum.concat()
+
+    extras = for c <- 0..256, !Enum.member?(codepoints, c), do: c
+
+    Map.new(
+      Enum.zip(
+        Enum.concat(codepoints, extras),
+        Enum.map(
+          Enum.concat(codepoints, Enum.with_index(extras, fn _c, index -> 256 + index end)),
+          &to_string([&1])
+        )
+      )
+    )
+  end
+
+  def fetch_vocab_list() do
+    :inets.start()
+
+    {:ok, {_status, _headers, body}} = :httpc.request([@bpe_vocab_list])
+
+    body
+    |> :zlib.gunzip()
+    |> String.split("\n")
+    |> Enum.slice(1, 49152 - 256 - 2 + 1)
+    |> Enum.map(&String.split(&1))
+    |> Enum.map(&List.to_tuple/1)
+  end
+
+  def build_vocab_list() do
+    byte_encoder = bytes_to_unicode()
+    bpe_vocab_subset = fetch_vocab_list()
+
+    vocab =
+      Enum.concat([
+        Map.values(byte_encoder),
+        Enum.map(Map.values(byte_encoder), &(&1 <> "</w>")),
+        Enum.map(bpe_vocab_subset, &Enum.join(Tuple.to_list(&1))),
+        ["<|startoftext|>", "<|endoftext|>"]
+      ])
+
+    encoder = Map.new(Enum.zip(vocab, 0..length(vocab)))
+
+    %{
+      encoder: encoder,
+      decoder: Map.new(encoder, fn {key, val} -> {val, key} end),
+      bpe_ranks: Map.new(Enum.zip(bpe_vocab_subset, 0..length(bpe_vocab_subset)))
+    }
+  end
+
+  # A word is represented as a tuple of symbols (symbols being variable-length strings).
+  def get_word(token) do
+    token
+    |> String.graphemes()
+    |> Enum.reverse()
+    |> then(fn [last | rest] -> [last <> "</w>" | rest] end)
+    |> Enum.reverse()
+  end
+
+  def get_pairs(word) do
+    word
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.map(&List.to_tuple/1)
+  end
+
+  def pairs_set(word), do: MapSet.new(get_pairs(word))
+
+  def bpe(token, vocab) do
+  end
+end
+```
+
+```elixir
+vocab = SimpleTokenizer.vocab()
+```
+
+```elixir
+SimpleTokenizer._encode("hełło there how are you", vocab)
+```
+
+```elixir
+bpe = fn token, vocab ->
+  word = SimpleTokenizer.get_word(token)
+  max_rank = Enum.count(vocab[:bpe_ranks])
+
+  reduce_pairs = fn word ->
+    pset = SimpleTokenizer.pairs_set(word)
+    min = Enum.min_by(pset, fn pair -> Map.get(vocab[:bpe_ranks], pair, max_rank) end)
+    IO.inspect(min)
+
+    word
+    |> SimpleTokenizer.get_pairs()
+    |> Enum.map(fn
+      {a, b} = chunk when chunk == min -> {a <> b}
+      chunk -> chunk
+    end)
+    |> tap(&IO.inspect/1)
+    |> Enum.reverse()
+    |> then(fn [last | rest] ->
+      Enum.reverse(Tuple.to_list(last)) ++ Enum.map(rest, &elem(&1, 0))
+    end)
+    |> Enum.reverse()
+  end
+
+  word
+  |> reduce_pairs.()
+  |> tap(&IO.inspect/1)
+  |> reduce_pairs.()
+  |> tap(&IO.inspect/1)
+  |> reduce_pairs.()
+  |> tap(&IO.inspect/1)
+  |> reduce_pairs.()
+  |> tap(&IO.inspect/1)
+end
+
+bpe.("hello", vocab)
+```
