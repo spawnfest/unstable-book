@@ -1,20 +1,22 @@
-# Unstable Book
+# SimpleTokenizer
 
 ```elixir
-Mix.install([
-  {:axon, github: "elixir-nx/axon"},
-  {:exla, "~> 0.2.2"},
-  {:nx, "~> 0.3.0", github: "elixir-nx/nx", sparse: "nx", branch: "main", override: true},
-  {:req, "~> 0.3.0"},
-  {:html_entities, "~> 0.5"}
-])
-
-EXLA.set_as_nx_default([:tpu, :cuda, :rocm, :host])
+Mix.install(
+  [
+    {:axon, "~> 0.2"},
+    {:axon_onnx, github: "elixir-nx/axon_onnx"},
+    {:exla, "~> 0.2.2"},
+    {:kino, "~> 0.7.0"},
+    {:nx, "~> 0.3.0", github: "elixir-nx/nx", sparse: "nx", branch: "main", override: true},
+    {:req, "~> 0.3.0"},
+    {:html_entities, "~> 0.5"},
+    {:table_rex, "~> 3.1.1"}
+  ],
+  config: [
+    nx: [default_backend: EXLA.Backend]
+  ]
+)
 ```
-
-## Intro
-
-An attempt to write a working implementation of Stable Diffusion inference in Elixir with Axon
 
 ## Prompt Tokenizer
 
@@ -210,5 +212,15 @@ Enum.count(Map.get(vocab, :byte_encoder))
 
 ```elixir
 {:ok, _} = SimpleTokenizer.start_link([])
-SimpleTokenizer.encode("an astonaut riding a horse on the moon")
+inputs = SimpleTokenizer.encode("an astonaut riding a horse on the moon")
+```
+
+```elixir
+max_prompt_length = 77
+
+phrase =
+  inputs ++ Enum.take(Stream.repeatedly(fn -> 49407 end), max_prompt_length - length(inputs))
+
+phrase_tensor = Nx.tensor([phrase], type: {:s, 32})
+pos_ids_tensor = Nx.tensor([Enum.to_list(0..(max_prompt_length - 1))], type: {:s, 32})
 ```
